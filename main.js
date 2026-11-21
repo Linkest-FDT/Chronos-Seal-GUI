@@ -1,272 +1,447 @@
-const { app, BrowserWindow, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, safeStorage } = require('electron');
 const path = require('path');
 const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
 const fs = require('fs');
+const os = require('os');
+const { spawn } = require('child_process');
 
 let mainWindow = null;
 
-const exeDir = path.dirname(app.getPath('exe'));
-app.setPath('userData', path.join(exeDir, 'Config'));
-app.setPath('sessionData', path.join(exeDir, 'Config'));
+if (app.isPackaged) {
+  const exeDir = path.dirname(app.getPath('exe'));
+  app.setPath('userData', path.join(exeDir, 'Config'));
+  app.setPath('sessionData', path.join(exeDir, 'Config'));
+} else {
+  console.log('>>> [开发模式] 使用默认 userData 路径，避免权限崩溃');
+}
 
-// ============================================================
-// 常量
-// ============================================================
 const GITHUB_CLIENT_ID = 'Iv23liFUMvAWTK75MEx4';
 const CALLBACK_PORT = 8080;
 const REDIRECT_URI = `http://127.0.0.1:${CALLBACK_PORT}/callback`;
+const PUBLIC_KEY_B64 = 'JcRAjq2AWR9+QPMXRQsqZC09yAnlOkS6Pguj45IRMk0=';
+const KERNEL_VERSION = 'V2.2';
+const SHELL_NAMES = [
+  'CLARE_LocalizationCore',
+  'CLARE_ImageCache',
+  'CLARE_AssetPreloader',
+  'CLARE_SaveIntegrity',
+  'CLARE_DLCManager'
+];
+
+const DEFAULT_KERNEL_SOURCES = [
+  { host: 'raw.githubusercontent.com', label: 'GitHub' },
+  { host: 'mirror.crclare.top',        label: 'CF Mirror' }
+];
+
+// 开发者模式动态获取镜像源
+function getKernelSources() {
+  const cfg = readConfig();
+  if (cfg.devMode === 'true' && cfg.customKernelSources) {
+    try {
+      const parsed = JSON.parse(cfg.customKernelSources);
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    } catch (e) {}
+  }
+  return DEFAULT_KERNEL_SOURCES;
+}
+
+function ensureDir(p) { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); }
+function getKernelCacheDir(engine) { return path.join(app.getPath('userData'), 'kernels', KERNEL_VERSION, engine.toUpperCase()); }
+function getFilesDir() { return path.join(app.getPath('userData'), 'Files'); }
+function getConfigDir() { return app.getPath('userData'); }
+function getConfigPath() { return path.join(getConfigDir(), 'config.ini'); }
+
+function readConfig() {
+  const f = getConfigPath();
+  if (!fs.existsSync(f)) return {};
+  let text;
+  try { text = fs.readFileSync(f, 'utf8'); } catch (e) { return {}; }
+  const result = {};
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith(';') || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    if (eq < 0) continue;
+    const key = line.slice(0, eq).trim();
+    const val = line.slice(eq + 1).trim();
+    if (key) result[key] = val;
+  }
+  return result;
+}
+
+function writeConfig(obj) {
+  const f = getConfigPath();
+  ensureDir(path.dirname(f));
+  const lines = ['; Chronos Seal GUI - Config', '; Auto-generated. Edit with care.', ''];
+  for (const k of Object.keys(obj).sort()) { lines.push(k + ' = ' + String(obj[k])); }
+  fs.writeFileSync(f, lines.join('\n'), 'utf8');
+}
+
+function updateConfig(patch) {
+  const cur = readConfig();
+  Object.assign(cur, patch);
+  writeConfig(cur);
+}
 
 // ============================================================
-// 窗口
+// Token 存取（safeStorage 全兼容 + 明文降级）
+// ============================================================
+async function saveGithubToken(token) {
+  const configDir = getConfigDir();
+  ensureDir(configDir);
+  try {
+    if (safeStorage.isEncryptionAvailable()) {
+      const encrypted = safeStorage.encryptString(token);
+      fs.writeFileSync(path.join(configDir, 'GithubToken.enc'), encrypted.toString('base64'), 'utf8');
+      return;
+    }
+  } catch (e) { console.warn('[safeStorage] 加密失败:', e.message); }
+  fs.writeFileSync(path.join(configDir, 'GithubToken'), token, { encoding: 'utf8', mode: 0o600 });
+}
+
+async function loadGithubToken() {
+  const configDir = getConfigDir();
+  const encPath = path.join(configDir, 'GithubToken.enc');
+  if (fs.existsSync(encPath)) {
+    try {
+      const b64Data = fs.readFileSync(encPath, 'utf8');
+      if (safeStorage.isEncryptionAvailable()) return safeStorage.decryptString(Buffer.from(b64Data, 'base64'));
+    } catch (e) { console.warn('[safeStorage] 解密失败:', e.message); }
+  }
+  const plainPath = path.join(configDir, 'GithubToken');
+  if (fs.existsSync(plainPath)) {
+    try { return fs.readFileSync(plainPath, 'utf8').trim(); } catch (e) { return null; }
+  }
+  return null;
+}
+
+async function clearGithubToken() {
+  const configDir = getConfigDir();
+  ['GithubToken.enc', 'GithubToken'].forEach(f => {
+    const p = path.join(configDir, f);
+    if (fs.existsSync(p)) try { fs.unlinkSync(p); } catch (e) {}
+  });
+}
+
+function sendLog(msg) { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('seal-log', String(msg)); }
+function sendProgress(percent, step, message) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('seal-progress', { percent: Math.max(0, Math.min(100, Math.round(percent))), step: step || null, message: message || null });
+  }
+}
+
+// HTTPS 工具（保留原有）
+function httpsPost(hostname, pathname, body, headers) {
+  return new Promise((resolve, reject) => {
+    const bodyStr = JSON.stringify(body);
+    const req = https.request({ hostname, path: pathname, method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(bodyStr) }, headers || {}) }, (res) => {
+      let data = ''; res.on('data', c => data += c);
+      res.on('end', () => { try { resolve({ status: res.statusCode, json: JSON.parse(data) }); } catch (e) { reject(new Error('响应解析失败')); } });
+    });
+    req.on('error', reject); req.write(bodyStr); req.end();
+  });
+}
+
+function httpsGet(hostname, pathname, headers) {
+  return new Promise((resolve, reject) => {
+    const req = https.request({ hostname, path: pathname, method: 'GET', headers: headers || {} }, (res) => {
+      let data = ''; res.on('data', c => data += c);
+      res.on('end', () => { try { resolve({ status: res.statusCode, json: JSON.parse(data) }); } catch (e) { reject(new Error('响应解析失败')); } });
+    });
+    req.on('error', reject); req.end();
+  });
+}
+
+function httpsGetBuffer(hostname, pathname, headers, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const req = https.request({ hostname, path: pathname, method: 'GET', headers: headers || {} }, (res) => {
+      if (res.statusCode < 200 || res.statusCode >= 300) { res.resume(); return reject(new Error('HTTP ' + res.statusCode)); }
+      const chunks = []; res.on('data', c => chunks.push(c));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+    });
+    req.on('error', reject);
+    if (timeoutMs) req.setTimeout(timeoutMs, () => req.destroy(new Error('请求超时')));
+    req.end();
+  });
+}
+
+// ============================================================
+// Node 检测（直接使用 Electron 内置运行时）
+// ============================================================
+function findNodePath() { return process.execPath; }
+
+function spawnJS(scriptPath, args, cwd, onProgress) {
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(findNodePath(), [scriptPath, ...args], {
+        cwd,
+        env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } // 灵魂注入
+      });
+    } catch (e) { return reject(new Error('无法启动内置 Node.js：' + e.message)); }
+
+    let stderrBuf = '';
+    child.stdout.on('data', (data) => {
+      for (const raw of data.toString('utf8').split(/\r?\n/)) {
+        const line = raw.trim(); if (!line) continue;
+        const mProgress = line.match(/^\[CS_PROGRESS\]\s+(\d+)/);
+        if (mProgress) { if (onProgress) onProgress(parseInt(mProgress[1], 10)); continue; }
+        const mError = line.match(/^\[CS_ERROR\]\s+(.+)/);
+        if (mError) { sendLog('[ERR] ' + mError[1]); continue; }
+        sendLog(line);
+      }
+    });
+
+    child.stderr.on('data', (data) => {
+      stderrBuf += data.toString('utf8');
+      for (const raw of data.toString('utf8').split(/\r?\n/)) {
+        const line = raw.trim(); if (line) sendLog('[STDERR] ' + line);
+      }
+    });
+
+    child.on('error', (e) => reject(new Error('Node.js 进程错误：' + e.message)));
+    child.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error('脚本退出码 ' + code + (stderrBuf ? '：' + stderrBuf.slice(0, 300) : '')));
+    });
+  });
+}
+
+// 内核拉取与验签（保留）
+async function fetchKernelFile(repoPath, timeoutMs) {
+  let lastErr = null;
+  const sources = getKernelSources();
+  for (const src of sources) {
+    try {
+      return await httpsGetBuffer(src.host, '/' + repoPath, { 'User-Agent': 'Chronos-Seal-GUI', 'Accept': '*/*' }, timeoutMs || 8000);
+    } catch (e) { lastErr = e; sendLog('[Kernel] ' + src.label + ' 失败: ' + e.message); }
+  }
+  throw new Error('所有源都不可用: ' + (lastErr ? lastErr.message : 'unknown'));
+}
+
+function verifyManifestSignature(manifestBuf, sigBytes) {
+  const pubKeyRaw = Buffer.from(PUBLIC_KEY_B64, 'base64');
+  const pubKeyObj = crypto.createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), pubKeyRaw]), format: 'der', type: 'spki' });
+  return crypto.verify(null, manifestBuf, pubKeyObj, sigBytes);
+}
+
+async function fetchAndVerifyKernel(engine) {
+  const basePath = `CrCLARE/Chronos-Seal-GUI/main/Tools/${KERNEL_VERSION}/${engine.toUpperCase()}`;
+  const localDir = getKernelCacheDir(engine);
+  sendLog('[Kernel] 拉取 manifest.json ...');
+  const manifestBuf = await fetchKernelFile(basePath + '/manifest.json');
+  const manifest = JSON.parse(manifestBuf.toString('utf8'));
+  sendLog('[Kernel] 拉取 manifest.sig ...');
+  const sigBuf = await fetchKernelFile(basePath + '/manifest.sig');
+  if (!verifyManifestSignature(manifestBuf, Buffer.from(sigBuf.toString('utf8').trim(), 'base64'))) throw new Error('❌ 内核签名验证失败！');
+
+  const fileNames = Object.keys(manifest.files || {});
+  ensureDir(localDir);
+  for (const name of fileNames) {
+    const fileBuf = await fetchKernelFile(basePath + '/' + name);
+    if (crypto.createHash('sha256').update(fileBuf).digest('hex') !== manifest.files[name]) throw new Error('❌ 文件哈希不匹配');
+    const dest = path.join(localDir, name);
+    ensureDir(path.dirname(dest));
+    fs.writeFileSync(dest, fileBuf);
+  }
+  fs.writeFileSync(path.join(localDir, '_verified.json'), JSON.stringify({ verifiedAt: new Date().toISOString(), manifest }, null, 2));
+  return localDir;
+}
+
+async function ensureKernel(engine) {
+  const localDir = getKernelCacheDir(engine);
+  const manifestPath = path.join(localDir, 'manifest.json');
+  const sigPath = path.join(localDir, 'manifest.sig');
+  if (fs.existsSync(manifestPath) && fs.existsSync(sigPath)) {
+    try {
+      const manifestBuf = fs.readFileSync(manifestPath);
+      const sigBytes = Buffer.from(fs.readFileSync(sigPath, 'utf8').trim(), 'base64');
+      if (verifyManifestSignature(manifestBuf, sigBytes)) return localDir;
+    } catch (e) {}
+  }
+  return await fetchAndVerifyKernel(engine);
+}
+
+// MV 加密流程（保留原有内容，此处略去具体细节，保持你原本的逻辑）
+async function sealProjectMV(pkg, gameName, version) {
+  sendProgress(2, 1, '派生种子');
+  const seedInfo = loadOrCreateSeed('mv', gameName, version);
+  const today = new Date().toISOString().slice(0, 10);
+  sendProgress(3, 2, '准备内核');
+  const kernelDir = await ensureKernel('mv');
+
+  sendProgress(5, 2, '生成 5 个壳插件');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-build-'));
+  try {
+    fs.copyFileSync(path.join(kernelDir, 'CLARE_Shell.mv.tmpl'), path.join(tmp, 'CLARE_Shell.mv.tmpl'));
+    const buildScript = path.join(kernelDir, 'mv_build.js');
+    for (let i = 1; i <= 5; i++) {
+      await spawnJS(buildScript, ['--shell', String(i), '--name', gameName, '--version', version, '--date', today, '--seed', seedInfo.seed, '--salt', String(seedInfo.salt)], tmp);
+    }
+    const shellSrcDir = path.join(tmp, 'www', 'js', 'plugins');
+    const shellDstDir = path.join(pkg, 'www', 'js', 'plugins');
+    ensureDir(shellDstDir);
+    if (fs.existsSync(shellSrcDir)) {
+      fs.readdirSync(shellSrcDir).forEach(f => fs.copyFileSync(path.join(shellSrcDir, f), path.join(shellDstDir, f)));
+    }
+    const tmpConfig = path.join(tmp, 'encrypt_config.json');
+    if (fs.existsSync(tmpConfig)) fs.copyFileSync(tmpConfig, path.join(pkg, 'encrypt_config.json'));
+  } finally { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e) {} }
+
+  const shellName = deriveShellName(seedInfo.seed, gameName, version);
+  const wwwIndex = path.join(pkg, 'www', 'index.html');
+  if (fs.existsSync(wwwIndex)) fs.writeFileSync(wwwIndex, renderIndexHtml(kernelDir, gameName, shellName), 'utf8');
+  await spawnJS(path.join(kernelDir, 'encrypt_assets_mv.js'), ['--encrypt'], pkg);
+  await spawnJS(path.join(kernelDir, 'encrypt_assets_mv.js'), ['--verify'], pkg);
+  sendProgress(100, 7, '完成');
+}
+
+async function sealProjectMZ(pkg, gameName, version) { throw new Error('MZ 模式尚未支持'); }
+
+function loadOrCreateSeed(engine, gameName, version) {
+  const gameDir = path.join(getFilesDir(), gameName + ' ' + version);
+  ensureDir(gameDir);
+  const configPath = path.join(gameDir, 'encrypt_config.json');
+  if (fs.existsSync(configPath)) {
+    try {
+      const cfg = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+      if (cfg.seed && cfg.seedSalt !== undefined) return { seed: cfg.seed, salt: cfg.seedSalt, gameDir };
+    } catch (e) {}
+  }
+  return { seed: crypto.randomBytes(engine === 'mv' ? 32 : 48).toString('hex'), salt: Math.floor(Math.random() * 0xFFFFFFFF) >>> 0, gameDir };
+}
+
+function deriveShellName(seedStr, gameName, version) {
+  return SHELL_NAMES[crypto.createHash('sha256').update(`${seedStr}|${gameName}|${version}`).digest()[0] % 5];
+}
+
+function renderIndexHtml(kernelDir, gameName, shellName) {
+  let content = fs.readFileSync(path.join(kernelDir, 'index.html'), 'utf8');
+  return content.replace(/@@GAME_NAME@@/g, gameName).replace(/@@SHELL_NAME@@/g, shellName);
+}
+
+// ============================================================
+// 窗口 & IPC 注册
 // ============================================================
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 900,
-    height: 650,
-    minWidth: 720,
-    minHeight: 480,
-    frame: false,
-    backgroundColor: '#0e0e12',
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false
-    }
+    width: 900, height: 650, minWidth: 720, minHeight: 480, frame: false, backgroundColor: '#0e0e12',
+    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false }
   });
-
   mainWindow.loadFile(path.join(__dirname, 'src', 'index.html'));
-
   mainWindow.on('closed', () => { mainWindow = null; });
 }
 
 ipcMain.on('window-minimize', () => { if (mainWindow) mainWindow.minimize(); });
 ipcMain.on('window-close', () => { if (mainWindow) mainWindow.close(); });
 
-// ============================================================
-// 工具函数
-// ============================================================
+// OAuth
 function generatePKCE() {
   const verifier = crypto.randomBytes(32).toString('base64url');
-  const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
-  return { verifier, challenge };
+  return { verifier, challenge: crypto.createHash('sha256').update(verifier).digest('base64url') };
 }
 
-function httpsPost(hostname, pathname, body, headers) {
-  return new Promise((resolve, reject) => {
-    const bodyStr = JSON.stringify(body);
-    const req = https.request({
-      hostname,
-      path: pathname,
-      method: 'POST',
-      headers: Object.assign({
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(bodyStr)
-      }, headers || {})
-    }, (res) => {
-      let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => {
-        try { resolve({ status: res.statusCode, json: JSON.parse(data) }); }
-        catch (e) { reject(new Error('响应解析失败: ' + data.slice(0, 200))); }
-      });
-    });
-    req.on('error', reject);
-    req.write(bodyStr);
-    req.end();
-  });
-}
-
-function httpsGet(hostname, pathname, headers) {
-  return new Promise((resolve, reject) => {
-    const req = https.request({
-      hostname,
-      path: pathname,
-      method: 'GET',
-      headers: headers || {}
-    }, (res) => {
-      let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => {
-        try { resolve({ status: res.statusCode, json: JSON.parse(data) }); }
-        catch (e) { reject(new Error('响应解析失败: ' + data.slice(0, 200))); }
-      });
-    });
-    req.on('error', reject);
-    req.end();
-  });
-}
-
-// ============================================================
-// 本地回调服务器
-// ============================================================
 function waitForCallback(timeoutMs) {
   return new Promise((resolve, reject) => {
+    let timer = null;
     const server = http.createServer((req, res) => {
       try {
         const url = new URL(req.url, `http://127.0.0.1:${CALLBACK_PORT}`);
-        if (url.pathname !== '/callback') {
-          res.writeHead(404);
-          res.end();
-          return;
-        }
+        if (url.pathname === '/favicon.ico') { res.writeHead(204); res.end(); return; }
+        if (url.pathname !== '/callback') { res.writeHead(404); res.end(); return; }
         const code = url.searchParams.get('code');
         const error = url.searchParams.get('error');
-
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        if (code) {
-          res.end('<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#0e0e12;color:#e8e8ef;"><h2>授权成功</h2><p>请返回 Chronos Seal 继续操作。</p></body></html>');
-        } else {
-          res.end('<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#0e0e12;color:#ef4444;"><h2>授权失败</h2><p>' + (error || '未知错误') + '</p></body></html>');
-        }
-
+        res.end(code ? '<h2>授权成功</h2><p>请返回 GUI</p>' : '<h2>授权失败</h2>');
+        if (timer) clearTimeout(timer);
         server.close();
-        if (code) resolve(code);
-        else reject(new Error(error || '用户拒绝授权'));
-      } catch (e) {
-        reject(e);
-      }
+        if (code) resolve(code); else reject(new Error(error || '用户拒绝授权'));
+      } catch (e) { if (timer) clearTimeout(timer); server.close(); reject(e); }
     });
-
-    server.on('error', (e) => {
-      reject(new Error('无法启动本地回调服务器（端口 ' + CALLBACK_PORT + ' 可能被占用）: ' + e.message));
-    });
-
-    server.listen(CALLBACK_PORT, '127.0.0.1', () => { /* ready */ });
-
-    setTimeout(() => {
-      server.close();
-      reject(new Error('授权超时（5 分钟）'));
-    }, timeoutMs || 5 * 60 * 1000);
+    server.on('error', (e) => { if (timer) clearTimeout(timer); reject(new Error('本地回调服务器失败：' + e.message)); });
+    server.listen(CALLBACK_PORT, '127.0.0.1', () => console.log('>>> 本地回调服务器已启动，监听 8080 端口'));
+    timer = setTimeout(() => { server.close(); reject(new Error('授权超时')); }, timeoutMs || 300000);
   });
 }
 
-// ============================================================
-// OAuth 主流程
-// ============================================================
-ipcMain.handle('github-login', async (event, { proxyUrl }) => {
-  const proxy = proxyUrl || 'https://proxy.crclare.top';
+ipcMain.handle('github-login', async () => {
   const { verifier, challenge } = generatePKCE();
-  const callbackPromise = waitForCallback(5 * 60 * 1000);
-
-  const authUrl = 'https://github.com/login/oauth/authorize'
-    + '?client_id=' + encodeURIComponent(GITHUB_CLIENT_ID)
-    + '&redirect_uri=' + encodeURIComponent(REDIRECT_URI)
-    + '&scope=' + encodeURIComponent('repo user workflow')
-    + '&code_challenge=' + challenge
-    + '&code_challenge_method=S256';
-
+  const callbackPromise = waitForCallback(300000);
+  const authUrl = `https://github.com/login/oauth/authorize?client_id=${GITHUB_CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&scope=${encodeURIComponent('repo user workflow')}&code_challenge=${challenge}&code_challenge_method=S256`;
   await shell.openExternal(authUrl);
-
   const code = await callbackPromise;
-
+  // 默认代理（无前端代理配置，硬编码默认）
+  const proxy = readConfig().devMode === 'true' && readConfig().customProxy ? readConfig().customProxy : 'https://proxy.crclare.top';
   const proxyUrlObj = new URL(proxy);
-  const proxyPath = proxyUrlObj.pathname + (proxyUrlObj.search || '');
-  const tokenRes = await httpsPost(
-    proxyUrlObj.hostname,
-    proxyPath,
-    { code, code_verifier: verifier }
-  );
-
-  if (tokenRes.json.error) {
-    throw new Error('Proxy 换 token 失败：' + tokenRes.json.error);
-  }
-  const accessToken = tokenRes.json.access_token;
-  if (!accessToken) {
-    throw new Error('Proxy 未返回 access_token');
-  }
-
-  const userRes = await httpsGet('api.github.com', '/user', {
-    'User-Agent': 'Chronos-Seal-GUI',
-    'Authorization': 'Bearer ' + accessToken,
-    'Accept': 'application/vnd.github+json'
-  });
-
-  if (userRes.status !== 200 || !userRes.json.login) {
-    throw new Error('获取 GitHub 用户信息失败');
-  }
-
-  const tokenFile = path.join(exeDir, 'Config', 'GithubToken');
-  try {
-    fs.mkdirSync(path.dirname(tokenFile), { recursive: true });
-    fs.writeFileSync(tokenFile, accessToken, { encoding: 'utf8', mode: 0o600 });
-  } catch (e) { /* non-fatal */ }
-
-  return {
-    login: userRes.json.login,
-    avatar_url: userRes.json.avatar_url || ''
-  };
+  const tokenRes = await httpsPost(proxyUrlObj.hostname, proxyUrlObj.pathname, { code, code_verifier: verifier });
+  if (tokenRes.json.error) throw new Error('换 token 失败：' + tokenRes.json.error);
+  const userRes = await httpsGet('api.github.com', '/user', { 'User-Agent': 'Chronos-Seal-GUI', 'Authorization': 'Bearer ' + tokenRes.json.access_token, 'Accept': 'application/vnd.github+json' });
+  await saveGithubToken(tokenRes.json.access_token);
+  updateConfig({ github_login: userRes.json.login });
+  return { login: userRes.json.login, avatar_url: userRes.json.avatar_url || '' };
 });
 
 ipcMain.handle('github-device-flow-start', async () => {
-  const res = await httpsPost(
-    'github.com',
-    '/login/device/code',
-    { client_id: GITHUB_CLIENT_ID, scope: 'repo user workflow' },
-    { 'Accept': 'application/json' }
-  );
-  if (res.json.error) throw new Error(res.json.error_description || res.json.error);
-  return {
-    device_code: res.json.device_code,
-    user_code: res.json.user_code,
-    verification_uri: res.json.verification_uri,
-    expires_in: res.json.expires_in,
-    interval: res.json.interval || 5
-  };
+  const res = await httpsPost('github.com', '/login/device/code', { client_id: GITHUB_CLIENT_ID, scope: 'repo user workflow' }, { 'Accept': 'application/json' });
+  return { device_code: res.json.device_code, user_code: res.json.user_code, verification_uri: res.json.verification_uri, expires_in: res.json.expires_in, interval: res.json.interval || 5 };
 });
 
-ipcMain.handle('github-device-flow-poll', async (event, { deviceCode, interval }) => {
-  const res = await httpsPost(
-    'github.com',
-    '/login/oauth/access_token',
-    {
-      client_id: GITHUB_CLIENT_ID,
-      device_code: deviceCode,
-      grant_type: 'urn:ietf:params:oauth:grant-type:device_code'
-    },
-    { 'Accept': 'application/json' }
-  );
+ipcMain.handle('github-device-flow-poll', async (event, { deviceCode }) => {
+  const res = await httpsPost('github.com', '/login/oauth/access_token', { client_id: GITHUB_CLIENT_ID, device_code: deviceCode, grant_type: 'urn:ietf:params:oauth:grant-type:device_code' }, { 'Accept': 'application/json' });
+  if (res.json.error) { if (res.json.error === 'authorization_pending' || res.json.error === 'slow_down') return null; throw new Error(res.json.error_description || res.json.error); }
+  const userRes = await httpsGet('api.github.com', '/user', { 'User-Agent': 'Chronos-Seal-GUI', 'Authorization': 'Bearer ' + res.json.access_token, 'Accept': 'application/vnd.github+json' });
+  await saveGithubToken(res.json.access_token);
+  updateConfig({ github_login: userRes.json.login });
+  return { login: userRes.json.login, avatar_url: userRes.json.avatar_url || '' };
+});
 
-  if (res.json.error) {
-    if (res.json.error === 'authorization_pending') return null;
-    if (res.json.error === 'slow_down') return null;
-    throw new Error(res.json.error_description || res.json.error);
-  }
-
-  const accessToken = res.json.access_token;
-  const userRes = await httpsGet('api.github.com', '/user', {
-    'User-Agent': 'Chronos-Seal-GUI',
-    'Authorization': 'Bearer ' + accessToken,
-    'Accept': 'application/vnd.github+json'
-  });
-
-  const tokenFile = path.join(exeDir, 'Config', 'GithubToken');
+ipcMain.handle('open-external', async (event, url) => { await shell.openExternal(url); });
+ipcMain.handle('github-logout', async () => { await clearGithubToken(); updateConfig({ github_login: '' }); return { ok: true }; });
+ipcMain.handle('github-get-status', async () => {
+  const token = await loadGithubToken();
+  if (!token) return { connected: false };
   try {
-    fs.mkdirSync(path.dirname(tokenFile), { recursive: true });
-    fs.writeFileSync(tokenFile, accessToken, { encoding: 'utf8', mode: 0o600 });
-  } catch (e) { /* non-fatal */ }
-
-  return {
-    login: userRes.json.login,
-    avatar_url: userRes.json.avatar_url || ''
-  };
+    const userRes = await httpsGet('api.github.com', '/user', { 'User-Agent': 'Chronos-Seal-GUI', 'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json' });
+    if (userRes.status === 200 && userRes.json.login) return { connected: true, login: userRes.json.login, avatar_url: userRes.json.avatar_url || '' };
+  } catch (e) {}
+  return { connected: false };
 });
 
-ipcMain.handle('open-external', async (event, url) => {
-  await shell.openExternal(url);
+ipcMain.handle('detect-node', async () => {
+  return { installed: true, version: process.versions.node, isEmbedded: true };
 });
 
-// ============================================================
-// 启动
-// ============================================================
+ipcMain.handle('install-node', async () => {
+  return { success: true, version: process.versions.node, nodePath: process.execPath };
+});
+
+ipcMain.handle('load-config', async () => readConfig());
+ipcMain.handle('save-config', async (event, patch) => { updateConfig(patch || {}); return { ok: true }; });
+
+// 开发者模式相关 IPC
+ipcMain.handle('toggle-dev-mode', async (event, enabled) => {
+  updateConfig({ devMode: enabled ? 'true' : 'false' });
+  return { ok: true };
+});
+
+ipcMain.handle('save-dev-config', async (event, { customProxy, customKernelSources }) => {
+  updateConfig({ customProxy: customProxy || '', customKernelSources: customKernelSources || '' });
+  return { ok: true };
+});
+
+ipcMain.handle('seal-project', async (event, opts) => {
+  const { packagePath, gameName, version, engine } = opts || {};
+  if (!packagePath || !gameName || !version) throw new Error('缺少必要参数');
+  if (engine === 'mv') await sealProjectMV(packagePath, gameName, version);
+  else if (engine === 'mz') await sealProjectMZ(packagePath, gameName, version);
+  else throw new Error('未知引擎');
+  return { ok: true, outputPath: packagePath };
+});
+
 app.whenReady().then(() => {
   createWindow();
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
-  });
+  app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
-
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
-});
+app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
