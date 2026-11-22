@@ -1,5 +1,8 @@
 # Chronos Seal GUI
 
+> ⚠️ STATUS: ARCHIVED (PAUSED)
+This project is no longer under active development. The transition to Godot engine has made the underlying RM-based encryption architecture obsolete. This repository remains as an architectural milestone and a monument to our early security explorations.
+
 **Time as the seal · Action as the key · Time itself guards originality**
 
 ---
